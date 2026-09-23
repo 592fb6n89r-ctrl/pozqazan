@@ -148,7 +148,7 @@
 
     <div class="card">
       <div class="stat-row">
-        <div>❤️ Bəyənmə: <b id="likeCountDisplay">0</b> / 1000</div>
+        <div>❤️ Bəyənmə hədəfi: <b id="likeThresholdDisplay">1000</b> / istifadəçi</div>
         <div>🎁 Hədiyyə sayı: <b id="giftCountDisplay">0</b></div>
         <div>🏆 Ümumi qazananlar: <b id="totalWinsDisplay">0</b></div>
       </div>
@@ -200,6 +200,11 @@
       <input id="baseChanceInput" type="number" min="0" max="100" step="0.5" placeholder="2">
       <div class="hint">İstədiyin qədər yüksəlt/aşağı sal (Finger Heart bonusu bunun üstünə əlavə olunur). Dəyişiklik dərhal tətbiq olunur.</div>
     </div>
+    <div class="field">
+      <label>❤️ Bəyənmə (ekran tıklama) hədəfi</label>
+      <input id="likeThresholdInput" type="number" min="1" step="1" placeholder="1000">
+      <div class="hint">Hər istifadəçi ÖZÜ bu qədər dəfə bəyənəndə (ekranı tıklayanda) poz qazan alır — ümumi bəyənmələrə deyil, hər kəsin öz sayına baxılır. Test üçün 50 kimi kiçik ədəd qoya bilərsən.</div>
+    </div>
     <div class="tiers-list">
       <div class="row"><span>🥉 1 jeton</span><span>Normal poz</span></div>
       <div class="row"><span>🥈 5 jeton</span><span>VIP poz</span></div>
@@ -221,7 +226,8 @@ let queue = JSON.parse(localStorage.getItem('poz_queue') || '[]');
 let leaderboard = JSON.parse(localStorage.getItem('poz_leaderboard') || '{}');
 let likeCount = parseInt(localStorage.getItem('poz_likecount') || '0');
 let giftCount = parseInt(localStorage.getItem('poz_giftcount') || '0');
-let seenLikeTotals = {}; // per room session, to avoid double counting cumulative like totals
+let userLikeCounts = JSON.parse(localStorage.getItem('poz_userlikes') || '{}'); // per-user like progress
+let likeThreshold = parseInt(localStorage.getItem('poz_likethreshold') || '1000');
 
 const TIERS = {
   normal:  {label:'Normal poz',  cls:'tier-normal',  dot:'dot-normal',  emoji:'🥉', min:1},
@@ -237,12 +243,19 @@ function tierForValue(v){
   return 'normal';
 }
 
+function setLikeThreshold(v){
+  likeThreshold = Math.max(1, parseInt(v) || 1000);
+  localStorage.setItem('poz_likethreshold', likeThreshold);
+  renderAll();
+}
+
 // ---------- PERSIST ----------
 function persist(){
   localStorage.setItem('poz_queue', JSON.stringify(queue));
   localStorage.setItem('poz_leaderboard', JSON.stringify(leaderboard));
   localStorage.setItem('poz_likecount', likeCount);
   localStorage.setItem('poz_giftcount', giftCount);
+  localStorage.setItem('poz_userlikes', JSON.stringify(userLikeCounts));
 }
 
 // ---------- GAME CONFIG ----------
@@ -387,7 +400,7 @@ function renderAll(){
   renderQueue();
   renderLeaderboard();
   renderChanceBox();
-  document.getElementById('likeCountDisplay').textContent = likeCount % 1000;
+  document.getElementById('likeThresholdDisplay').textContent = likeThreshold;
   document.getElementById('giftCountDisplay').textContent = giftCount;
   document.getElementById('totalWinsDisplay').textContent = Object.values(leaderboard).reduce((a,b)=>a+b,0);
 }
@@ -535,6 +548,14 @@ function disconnectWS(){
 
 const processedMsgIds = new Set(); // dedupe raw messages
 const pendingStreaks = {}; // giftId+userId -> latest streak state, to avoid double counting
+const recentGiftKeys = {}; // extra safety net against resent/duplicate gift events
+
+function isDuplicateGift(key){
+  const now = Date.now();
+  if(recentGiftKeys[key] && (now - recentGiftKeys[key]) < 3000) return true;
+  recentGiftKeys[key] = now;
+  return false;
+}
 
 function handleEvent(raw){
   if(!raw || typeof raw !== 'object') return;
@@ -574,6 +595,15 @@ function handleEvent(raw){
     }
     delete pendingStreaks[streakKey];
 
+    // Extra safety: sometimes the exact same finalized gift event gets delivered twice
+    // (reconnects, relay resends). If we saw this exact user+gift+amount in the last
+    // few seconds, treat it as a duplicate instead of a second win.
+    const dupKey = userId + '_' + (msg.giftId ?? 'g') + '_' + diamond + '_' + repeatCount;
+    if(isDuplicateGift(dupKey)){
+      log('⏭️ Təkrarlanan hədiyyə mesajı nəzərə alınmadı: ' + dupKey);
+      return;
+    }
+
     // Finger Heart doesn't queue a game — it boosts the win CHANCE for whoever plays next
     if(giftName.includes('finger heart')){
       addFingerHeartBoost(FINGER_HEART_BOOST * (repeatCount || 1));
@@ -585,13 +615,16 @@ function handleEvent(raw){
     addWin(username, tierForValue(totalValue), `${totalValue} jeton`);
   }
   else if(type.includes('like')){
+    const user = msg.user || {};
+    const username = user.nickname || user.uniqueId || 'Bəyənən izləyici';
     const inc = Number(msg.likeCount ?? msg.count ?? 1);
     likeCount += inc;
-    while(likeCount >= 1000){
-      likeCount -= 1000;
-      const user = msg.user || {};
-      const username = user.nickname || user.uniqueId || 'Bəyənən izləyici';
-      addWin(username, 'normal', '1000 bəyənmə bonusu');
+
+    // Per-user progress: each viewer's OWN like count matters, not the room total.
+    userLikeCounts[username] = (userLikeCounts[username] || 0) + inc;
+    while(userLikeCounts[username] >= likeThreshold){
+      userLikeCounts[username] -= likeThreshold;
+      addWin(username, 'normal', `${likeThreshold} bəyənmə hədəfi`);
     }
     persist();
     renderAll();
@@ -612,11 +645,14 @@ function openSettings(){
   document.getElementById('uniqueIdInput').value = localStorage.getItem('poz_uniqueId') || '';
   document.getElementById('apiKeyInput').value = localStorage.getItem('poz_apiKey') || 'euler_ZDRlM2I4OGRjMWNlYjY1ZjllYWQwNTRhMjdmZDg2YjhjYTFiYjMzZTMwMzFlYjJkYTkzMzVh';
   document.getElementById('baseChanceInput').value = baseChance;
+  document.getElementById('likeThresholdInput').value = likeThreshold;
   document.getElementById('settingsOverlay').classList.add('show');
 }
 document.addEventListener('DOMContentLoaded', () => {
-  const input = document.getElementById('baseChanceInput');
-  if(input) input.addEventListener('input', () => setBaseChance(input.value));
+  const chanceInput = document.getElementById('baseChanceInput');
+  if(chanceInput) chanceInput.addEventListener('input', () => setBaseChance(chanceInput.value));
+  const likeInput = document.getElementById('likeThresholdInput');
+  if(likeInput) likeInput.addEventListener('input', () => setLikeThreshold(likeInput.value));
 });
 function closeSettings(){ document.getElementById('settingsOverlay').classList.remove('show'); }
 function saveAndConnect(){
